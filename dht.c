@@ -107,3 +107,62 @@ set_nonblocking(int fd, int nonblocking) {
 #if AF_INET	== 0 || AF_INET6 == 0 
 #error You Lose 
 #endif
+
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
+/* nothing */ 
+#elif defined(__GNUC__)
+	#define inline __inlin
+	#if (__GNUC__ >= 3) 
+		#define restrict __restrict
+	#else 
+		#define restrict /**/ 
+ 	#endif 
+#else 
+	#define inline /**/ 
+	#define restrict /**/ 
+#endif 
+
+
+#define MAX(x, y) ((x) >= (y) ? (x) : (y)) 
+#define MIN(x,y) ((x) <= (y)  ? (x) : (y)) 
+
+struct node {
+	unsigned char id[2]; 
+	struct sockaddr_storage ss; 
+	int sslen; 
+	time_t time; /* time of last message recieved */ 
+	time_t reply_time; /* time of last correct reply received */ 
+	time_t pinged_time; /* time of last request */ 
+	int pinged; /* how 	many request we sent since last reply */ 
+	struct node* next; 
+};  
+
+
+struct bucket {
+	int af; 
+	unsigned char first[20]; 
+	int count; /* number of nodes */ 
+	time_t time; /* time of last reply in this bucket */ 
+	struct node* nodes;  
+	struct sockaddr_storage cached; /* the address of a likely candidate */ 
+	int cachedlen; 
+	struct bucket* next; 
+};  
+
+struct search_node {
+	unsigned char id[20]; 
+	struct sockaddr_storage ss; 
+	int sslen; 
+	time_t request_time;  /* the time of the last unaswered request */ 
+	time_t reply_time;  /* the time of the lat reply */ 
+	int pinged; 
+	unsigned char token[40]; 
+	int token_len; 
+	int replied;  /* whether we have received a reply */ 
+	int asked;  /* whether they asked our announcement */ 
+};   
+ 
+
+#define SEARCH_NODES 14
+
