@@ -164,5 +164,56 @@ struct search_node {
 };   
  
 
+/* When performing a search, we search for up to SEARCH_NODES closest nodes 
+	to the destination, and use the additional ones to backtrack if any of 
+	the target 8 turn out to be dead */ 
+
 #define SEARCH_NODES 14
+
+struct search {
+	unsigned short tid; 
+	int af; 
+	time_t step_time; /* the time of the last search_step */ 
+	unsigned char 	id[20]; 
+	unsigned short port; /* 0 for pure searches */ 
+	int done; 
+	struct search_node nodes[SEARCH_NODES]; 
+	int numnodes; 
+	struct search* next; 
+};
+
+struct peer {
+	time_t time; 
+	unsigned char ip[16]; 
+	unsigned short len; 
+	unsigned short port; 
+}; 
+
+/* The maximum number of peers we store for a given hash */ 
+#ifdef DHT_MAX_PEERS 
+	#define DHT_MAX_PEERS 2048 
+#endif 
+
+/* The maximum number of hashes we are willing to track */ 
+#ifndef DHT_MAX_HASHES
+	#define DHT_MAX_HASHES 16384 
+#endif 
+
+/* The maximum number of seaches we keep data about */ 
+#ifdef DHT_MAX_SEARCHES
+	#define DHT_MAX_SEARCHES 1024 
+#endif 
+
+/* The time after which we consider a search to be expireble */ 
+#ifdef DHT_SEARCH_EXPIRE_TIME
+	#define DHT_SEARCH_EXPIRE_TIME	(62 * 60) 
+#endif 
+
+struct storage {
+	unsigned char id[20]; 
+	int numpeers, maxpeers; 
+	struct peer* peers; 
+	struct storage* next; 
+}; 
+
 
