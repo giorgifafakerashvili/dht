@@ -217,3 +217,294 @@ struct storage {
 }; 
 
 
+static struct storage* find_storage(const unsigned char* id); 
+static void flush_search_node(struct search_node* n, struct search* sr); 
+
+static int send_ping(const struct sockaddr* sa, int salen, 
+					 const unsigned char* tid, int tid_len); 
+static int send_pong(const struct sockaddr* sa, int salen, 
+					 const unsigned char* tid, int tid_len); 
+static int send_find_node(const struct sockaddr* sa, int salen, 
+						  const unsigned char* tid, int tid_len, 
+						  const unsigned char* target, int want, int confirm); 
+static int send_nodes_peers(const struct sockaddr* sa, int salen, 
+							const unsigned char* tid, int tid_len, 
+							const unsigned char* nodes, int nodes_len, 
+							const unsigned char* nodes6, int nodes6_len,
+							int af, struct storage* st, 
+							const unsigned char* token, int token_len); 
+static int send_closest_nodes(const struct sockaddr* sa, int salen, 
+							  const unsigned char* tid, int tid_len, 
+							  const unsigned char* id, int want, 
+							  int af, struct storage* st, 
+							  const unsigned char* token, int token_len); 
+static int send_get_peers(const struct sockaddr* sa, int salen, 
+						  unsigned char* tid, int tid_len, 
+						  unsigned char* infohash, int want, int confirm); 
+
+static int send_peer_announcement(const struct sockaddr* sa, int salen, 
+								  unsigned char* tid, int tid_len, 
+								  unsigned char* infohas, unsigned short port,
+								  unsigned char* token, int token_len, int confirm); 
+static int send_peer_announced(struct sockaddr* sa, int salen, 
+							   unsigned char* tid, int tid_len); 
+static int send_error(const struct sockaddr* sa, int sa_len,
+					  unsigned char* tid, int tid_len, 
+					  int code, const char* message); 
+
+#define ERROR 0	
+#define REPLY 1 
+#define PING 2
+#define FIND_NODE 3 
+#define GET_PEERS 4 
+#define ANNOUNCE_PEER 5 
+
+#define WANT 1 
+#define WANT6 2 
+
+static int parse_message(const unsigned char* buf, int buflen, 
+						 unsigned char* tid, int* tid_len, 
+						 unsigned char* id_return, 
+						 unsigned char* info_hash_return, 
+						 unsigned char* target_return, 
+						 unsigned short* port_return, 
+						 unsigned char* token_return, int* token_len, 
+						 unsigned char* nodes_return, int* nodes_len, 
+						 unsigned char* nodes6_return, int* nodes6_len, 
+						 unsigned char* values_return, int* values_len, 
+						 unsigned char* values6_return, int* values6_len,
+						 int* want_return); 
+
+static const unsigned char zeros[20] = {0}; 
+static const unsigned char ones[20] = {
+	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF
+};
+
+static const unsigned char v4prefix[16] = {
+	    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0, 0, 0, 0
+};
+
+
+static int dht_socket = -1; 
+static int dht_socket6 = -1; 
+
+static time_t search_time; 
+static time_t confirm_nodes_time; 
+static time_t rotate_secrets_time; 
+
+static unsigned char myid[20]; 
+static int have_v = 0; 
+static unsigned char my_v[9]; 
+static unsigned char secret[8]; 
+static unsigned char oldsecret[8]; 
+
+static struct bucket* buckets = NULL; 
+static struct bucket* buckets6 = NULL; 
+static struct storage* storage; 
+static int numstorage; 
+
+static struct search* searches = NULL; 
+static int numsearches; 
+static unsigned short search_id; 
+
+/* The maximum number of nodes that we snub. There is probably little 
+ * reason to increase this value */ 
+#ifndef DHT_MAX_BLACKLISTED 
+	#define DHT_MAX_BLACKLISTED 10
+#endif 
+static struct sockaddr_storage blacklist[DHT_MAX_BLACKLISTED]; 
+int next_blacklisted; 
+
+static struct timeval now; 
+static time_t mybucket_grow_time, mybucket6_grow_time; 
+static time_t expire_stuff_time; 
+
+#define MAX_TOKEN_BUCKET_TOKENS	400 
+static time_t token_bucket_time; 
+static int token_bucket_tokens; 
+
+FILE* dht_debug = NULL; 
+
+
+#ifdef __GNUC__
+	__attribute__ ((format(printf, 1, 2)))
+#endif 
+
+static void
+debugf(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    if(dht_debug)
+        vfprintf(dht_debug, format, args);
+    va_end(args);
+    if(dht_debug)
+        fflush(dht_debug);
+}
+
+static void 
+debug_printable(const unsigned char* buf, int buflen) {
+	int i; 
+	if(dht_debug) {
+		for(i = 0; i < buflen; ++i) {
+			putc(buf[i] >= 32 && buf[i] <= 126 ? buf[i] : '.', dht_debug) ;
+		}
+	}
+}
+	
+
+static void 
+print_hex(FILE* f, const unsigned char* buf, int buflen) {
+	int i; 
+	for(i = 0; i < buflen; ++i) {
+		fprintf(f, "%02x", buf[i]); 
+	}
+}
+
+
+static int 
+is_martian(const struct sockaddr* sa) {
+	switch(sa->sa_family) {
+		case AF_INET: {
+			struct sockaddr_in* sin = (struct sockaddr_in*) sa; 
+			const unsigned char* address = (const unsigned char*) &sin->sin_addr;
+			return sin->sin_port == 0 || 
+					(address[0] == 0) || 
+					(address[0] == 127) || 
+					((address[0] & 0xE0) == 0xE0);
+		}
+
+		case AF_INET6:  {
+			struct sockaddr_in6* sin6 = (struct sockaddr_in6*) sa; 
+			const unsigned char* address = (const unsigned char*) &sin6->sin6_addr; 
+			return sin6->sin6_port == 0 ||
+            (address[0] == 0xFF) ||
+            (address[0] == 0xFE && (address[1] & 0xC0) == 0x80) ||
+            (memcmp(address, zeros, 15) == 0 &&
+             (address[15] == 0 || address[15] == 1)) ||
+            (memcmp(address, v4prefix, 12) == 0);
+			
+		} 
+
+		default: 
+		return 0;
+	}
+}
+
+/* Forget about the ``XOR-metric''.  An id is just a path from the
+   root of the tree, so bits are numbered from the start. */
+
+static int
+id_cmp(const unsigned char *restrict id1, const unsigned char *restrict id2)
+{
+    /* Memcmp is guaranteed to perform an unsigned comparison. */
+    return memcmp(id1, id2, 20);
+}
+
+/* Find the lowest 1 bit in an id. */
+static int
+lowbit(const unsigned char *id)
+{
+    int i, j;
+    for(i = 19; i >= 0; i--)
+        if(id[i] != 0)
+            break;
+
+    if(i < 0)
+        return -1;
+
+    for(j = 7; j >= 0; j--)
+        if((id[i] & (0x80 >> j)) != 0)
+            break;
+
+    return 8 * i + j;
+}
+
+/* Find how many bits two ids have in common. */
+static int
+common_bits(const unsigned char *id1, const unsigned char *id2)
+{
+    int i, j;
+    unsigned char xor;
+    for(i = 0; i < 20; i++) {
+        if(id1[i] != id2[i])
+            break;
+    }
+
+    if(i == 20)
+        return 160;
+
+    xor = id1[i] ^ id2[i];
+
+    j = 0;
+    while((xor & 0x80) == 0) {
+        xor <<= 1;
+        j++;
+    }
+
+    return 8 * i + j;
+}
+
+/* Determine whether id1 or id2 is closer to ref */
+static int
+xorcmp(const unsigned char *id1, const unsigned char *id2,
+       const unsigned char *ref)
+{
+    int i;
+    for(i = 0; i < 20; i++) {
+        unsigned char xor1, xor2;
+        if(id1[i] == id2[i])
+            continue;
+        xor1 = id1[i] ^ ref[i];
+        xor2 = id2[i] ^ ref[i];
+        if(xor1 < xor2)
+            return -1;
+        else
+            return 1;
+    }
+    return 0;
+}
+
+
+/* We keep buckets in sorted list list. A bucket b ranges from 
+ b->first inclusive up to b->next->first exclusive */ 
+static int
+in_bucket(const unsigned char *id, struct bucket *b)
+{
+    return id_cmp(b->first, id) <= 0 &&
+        (b->next == NULL || id_cmp(id, b->next->first) < 0);
+}	
+
+
+static struct bucket* 
+find_bucket(unsigned const char* id, int af) {
+	struct bucket* b = af == AF_INET ? buckets : buckets6;
+
+	if(b == NULL) 
+		return NULL; 
+
+	while(1) {
+		if(b->next == NULL) 
+			return b; 
+		if(id_cmp(id, b->next->first) < 0) 
+			return b; 
+		b = b->next; 
+	}
+}
+
+
+
+static struct bucket* 
+previous_bucket(struct bucket* b) {
+	struct bucket* p = b->af == AF_INET ? buckets : buckets6; 
+
+	if(b == p) return NULL; 
+	while(1) {
+		if(p->next == NULL) return NULL; 
+		if(p->next == b) return p; 
+		p = p->next; 
+	}
+}
+
