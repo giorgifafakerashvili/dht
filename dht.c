@@ -706,3 +706,486 @@ node_blacklisted(const struct sockaddr* sa, int salen) {
 	return 0; 
 }
 
+
+/* split bucket into two equal parts */ 
+static struct bucket* 
+split_bucket(struct bucket* b) {
+	struct bucket* new; 
+	struct node* nodes; 
+	int rc; 
+	unsigned char new_id[20]; 
+
+	rc = bucket_middle(b, new_id); 
+	if(rc < 0) 
+		return NULL; 
+
+	new = calloc(1, sizeof(struct bucket)); 
+	if(new == NULL) 
+		return NULL; 
+
+	new->af = b->af; 
+
+	send_cached_ping(b); 
+
+	memcpy(new->first, new_id, 20); 
+	new->time = b->time; 
+
+	node = b->nodes; 
+	b->nodes = NULL; 
+	b->count= 0; 
+	new->next = b->next; 
+	b->next = new; 
+
+	while(nodes) {
+		struct node* n; 
+		n = nodes; 
+		nodes = nodes->next; 
+		insert_nodes(n); 
+	} 
+
+	return b; 
+}
+
+static struct node *
+new_node(const unsigned char *id, const struct sockaddr *sa, int salen,
+         int confirm)
+{
+    struct bucket *b = find_bucket(id, sa->sa_family);
+    struct node *n;
+    int mybucket, split;
+
+    if(b == NULL)
+        return NULL;
+
+    if(id_cmp(id, myid) == 0)
+        return NULL;
+
+    if(is_martian(sa) || node_blacklisted(sa, salen))
+        return NULL;
+
+    mybucket = in_bucket(myid, b);
+
+    if(confirm == 2)
+        b->time = now.tv_sec;
+
+    n = b->nodes;
+    while(n) {
+        if(id_cmp(n->id, id) == 0) {
+            if(confirm || n->time < now.tv_sec - 15 * 60) {
+                /* Known node.  Update stuff. */
+                memcpy((struct sockaddr*)&n->ss, sa, salen);
+                if(confirm)
+                    n->time = now.tv_sec;
+                if(confirm >= 2) {
+                    n->reply_time = now.tv_sec;
+                    n->pinged = 0;
+                    n->pinged_time = 0;
+                }
+            }
+            return n;
+        }
+        n = n->next;
+    }
+
+    /* New node. */
+
+    if(mybucket) {
+        if(sa->sa_family == AF_INET)
+            mybucket_grow_time = now.tv_sec;
+        else
+            mybucket6_grow_time = now.tv_sec;
+    }
+
+    /* First, try to get rid of a known-bad node. */
+    n = b->nodes;
+    while(n) {
+        if(n->pinged >= 3 && n->pinged_time < now.tv_sec - 15) {
+            memcpy(n->id, id, 20);
+            memcpy((struct sockaddr*)&n->ss, sa, salen);
+            n->time = confirm ? now.tv_sec : 0;
+            n->reply_time = confirm >= 2 ? now.tv_sec : 0;
+            n->pinged_time = 0;
+            n->pinged = 0;
+            return n;
+        }
+        n = n->next;
+    }
+
+    if(b->count >= 8) {
+        /* Bucket full.  Ping a dubious node */
+        int dubious = 0;
+        n = b->nodes;
+        while(n) {
+            /* Pick the first dubious node that we haven't pinged in the
+               last 15 seconds.  This gives nodes the time to reply, but
+               tends to concentrate on the same nodes, so that we get rid
+               of bad nodes fast. */
+            if(!node_good(n)) {
+                dubious = 1;
+                if(n->pinged_time < now.tv_sec - 15) {
+                    unsigned char tid[4];
+                    debugf("Sending ping to dubious node.\n");
+                    make_tid(tid, "pn", 0);
+                    send_ping((struct sockaddr*)&n->ss, n->sslen,
+                              tid, 4);
+                    n->pinged++;
+                    n->pinged_time = now.tv_sec;
+                    break;
+                }
+            }
+            n = n->next;
+        }
+
+        split = 0;
+        if(mybucket) {
+            if(!dubious)
+                split = 1;
+            /* If there's only one bucket, split eagerly.  This is
+               incorrect unless there's more than 8 nodes in the DHT. */
+            else if(b->af == AF_INET && buckets->next == NULL)
+                split = 1;
+            else if(b->af == AF_INET6 && buckets6->next == NULL)
+                split = 1;
+        }
+
+        if(split) {
+            debugf("Splitting.\n");
+            b = split_bucket(b);
+            return new_node(id, sa, salen, confirm);
+        }
+
+        /* No space for this node.  Cache it away for later. */
+        if(confirm || b->cached.ss_family == 0) {
+            memcpy(&b->cached, sa, salen);
+            b->cachedlen = salen;
+        }
+
+        return NULL;
+    }
+
+    /* Create a new node. */
+    n = calloc(1, sizeof(struct node));
+    if(n == NULL)
+        return NULL;
+    memcpy(n->id, id, 20);
+    memcpy(&n->ss, sa, salen);
+    n->sslen = salen;
+    n->time = confirm ? now.tv_sec : 0;
+    n->reply_time = confirm >= 2 ? now.tv_sec : 0;
+    n->next = b->nodes;
+    b->nodes = n;
+    b->count++;
+    return n;
+}
+
+
+
+/** called periodically to purge known-bd nodes. Note that we're very 
+ * converstive here; broken nodes in the table don't 	do much hurm, 
+ * we'll recover as soon as we find better ones */ 
+static int 
+expire_bucket(struct bucket* b) {
+	while(b) {
+		struct node* n, *p; 
+		int changed; 
+
+		while(b->nodes && b->nodes->pinged >= 4) {
+			n = b->nodes; 
+			b->nodes = n->next; 
+			b->count--; 
+			changed = 1; 
+			free(n); 
+		}
+
+		p = b->nodes; 
+		while(p) {
+			while(p->next && p->next->pinged >= 4) {
+				n = p->next; 
+				p->next = n->next; 
+				b->count--; 
+				changed = 1; 
+				free(n); 
+			}
+		}
+
+		if(changed)
+			send_cached_ping(b); 
+
+		b = b->next; 
+	}
+
+	expire_stuff_time = now.tv_sec + 120  +random() % 240; 
+	return 1; 
+}
+
+/* *****************************
+ *  while a seach in progress, we dont' necceresly keep the nodes beiing
+ * walked in the main bucket table. A search in progress 
+ */ 
+static int search* 
+find_search(unsigned short tid, int af) {
+	struct search* sr = searches; 
+	while(sr) {
+		if(sr->tid == tid && sr->af == af)
+			return sr; 
+		sr = sr->next; 
+	}
+
+	return NULL; 
+}
+
+static int 
+insert_search_node(unsigned char* id, 
+				   const struct sockaddr* sa, int salen, 
+				   struct search* sr, int replied,
+				   unsigned char* token, int token_len) {
+	struct search_node* n; 
+	int i, j; 
+
+	if(sa->family != sr->af) {
+		debugf("Attempting to insert node in the wron gfamily"); 
+		return 0; 
+	}
+
+	for(i = 0; i < sr->numnodes; ++i) {
+		if(id_cmp(id, src->nodes[i].id) == 0) {
+			n = &sr->nodes[i];
+			goto found; 
+		}
+
+		if(xorcmp(id, src->node[i].id) == 0) break; 
+	}
+
+	if(i == SEARCH_NODES) 
+		return 0; 
+
+	if(sr->numnodes < SEARCH_NODES) 
+		sr->numnodes++; 
+
+	for(j = sr->numnodes - 1; j > i; --j) {
+		sr->nodes[j] = sr->nodes[j-1]; 
+	}
+
+	n = &sr->nodes[i]; 	
+
+	memset(&n->ss, sa, salen); 
+	memcpy(n->id, id, 20); 
+
+found:
+	memcpy(&n->ss, sa, salen); 
+	n->sslen = salne; 
+
+	if(replied) {
+		n->replied = 1; 
+		n->reply_time = now.tv_sec; 
+		n->request_time = 0; 
+		n->pinged = 0; 
+	}
+
+	if(token) {
+		if(token_len >= 40) {
+			debugf("Eek! overlog token\n"); 
+		} else {
+			 memcpy(n->token, token, token_len);
+            n->token_len = token_len;
+		}
+	}
+
+	    return 1;
+
+}
+
+static void 
+flush_search_node(struct search_node* n, struct search* sr) {
+	int i = n - sr->nodes, j; 
+	for(j = i; j < sr->numnodes - 1; ++j) {
+		sr->nodes[j] = sr->nodes[j+1]; 
+	}
+	sr->numnodes--; 
+}
+
+static void
+expire_searches(void)
+{
+    struct search *sr = searches, *previous = NULL;
+
+    while(sr) {
+        struct search *next = sr->next;
+        if(sr->step_time < now.tv_sec - DHT_SEARCH_EXPIRE_TIME) {
+            if(previous)
+                previous->next = next;
+            else
+                searches = next;
+            free(sr);
+            numsearches--;
+        } else {
+            previous = sr;
+        }
+        sr = next;
+    }
+}
+
+/* This must always return 0 or 1, never -1, not even on failure (see below). */
+static int
+search_send_get_peers(struct search *sr, struct search_node *n)
+{
+    struct node *node;
+    unsigned char tid[4];
+
+    if(n == NULL) {
+        int i;
+        for(i = 0; i < sr->numnodes; i++) {
+            if(sr->nodes[i].pinged < 3 && !sr->nodes[i].replied &&
+               sr->nodes[i].request_time < now.tv_sec - 15)
+                n = &sr->nodes[i];
+        }
+    }
+
+    if(!n || n->pinged >= 3 || n->replied ||
+       n->request_time >= now.tv_sec - 15)
+        return 0;
+
+    debugf("Sending get_peers.\n");
+    make_tid(tid, "gp", sr->tid);
+    send_get_peers((struct sockaddr*)&n->ss, n->sslen, tid, 4, sr->id, -1,
+                   n->reply_time >= now.tv_sec - 15);
+    n->pinged++;
+    n->request_time = now.tv_sec;
+    /* If the node happens to be in our main routing table, mark it
+       as pinged. */
+    node = find_node(n->id, n->ss.ss_family);
+    if(node) pinged(node, NULL);
+    return 1;
+}
+
+/* When a search is in progress, we periodically call search_step to send
+   further requests. */
+static void
+search_step(struct search *sr, dht_callback *callback, void *closure)
+{
+    int i, j;
+    int all_done = 1;
+
+    /* Check if the first 8 live nodes have replied. */
+    j = 0;
+    for(i = 0; i < sr->numnodes && j < 8; i++) {
+        struct search_node *n = &sr->nodes[i];
+        if(n->pinged >= 3)
+            continue;
+        if(!n->replied) {
+            all_done = 0;
+            break;
+        }
+        j++;
+    }
+
+    if(all_done) {
+        if(sr->port == 0) {
+            goto done;
+        } else {
+            int all_acked = 1;
+            j = 0;
+            for(i = 0; i < sr->numnodes && j < 8; i++) {
+                struct search_node *n = &sr->nodes[i];
+                struct node *node;
+                unsigned char tid[4];
+                if(n->pinged >= 3)
+                    continue;
+                /* A proposed extension to the protocol consists in
+                   omitting the token when storage tables are full.  While
+                   I don't think this makes a lot of sense -- just sending
+                   a positive reply is just as good --, let's deal with it. */
+                if(n->token_len == 0)
+                    n->acked = 1;
+                if(!n->acked) {
+                    all_acked = 0;
+                    debugf("Sending announce_peer.\n");
+                    make_tid(tid, "ap", sr->tid);
+                    send_announce_peer((struct sockaddr*)&n->ss,
+                                       sizeof(struct sockaddr_storage),
+                                       tid, 4, sr->id, sr->port,
+                                       n->token, n->token_len,
+                                       n->reply_time >= now.tv_sec - 15);
+                    n->pinged++;
+                    n->request_time = now.tv_sec;
+                    node = find_node(n->id, n->ss.ss_family);
+                    if(node) pinged(node, NULL);
+                }
+                j++;
+            }
+            if(all_acked)
+                goto done;
+        }
+        sr->step_time = now.tv_sec;
+        return;
+    }
+
+    if(sr->step_time + 15 >= now.tv_sec)
+        return;
+
+    j = 0;
+    for(i = 0; i < sr->numnodes; i++) {
+        j += search_send_get_peers(sr, &sr->nodes[i]);
+        if(j >= 3)
+            break;
+    }
+    sr->step_time = now.tv_sec;
+    return;
+
+ done:
+    sr->done = 1;
+    if(callback)
+        (*callback)(closure,
+                    sr->af == AF_INET ?
+                    DHT_EVENT_SEARCH_DONE : DHT_EVENT_SEARCH_DONE6,
+                    sr->id, NULL, 0);
+    sr->step_time = now.tv_sec;
+}
+
+static struct search *
+new_search(void)
+{
+    struct search *sr, *oldest = NULL;
+
+    /* Find the oldest done search */
+    sr = searches;
+    while(sr) {
+        if(sr->done &&
+           (oldest == NULL || oldest->step_time > sr->step_time))
+            oldest = sr;
+        sr = sr->next;
+    }
+
+    /* The oldest slot is expired. */
+    if(oldest && oldest->step_time < now.tv_sec - DHT_SEARCH_EXPIRE_TIME)
+        return oldest;
+
+    /* Allocate a new slot. */
+    if(numsearches < DHT_MAX_SEARCHES) {
+        sr = calloc(1, sizeof(struct search));
+        if(sr != NULL) {
+            sr->next = searches;
+            searches = sr;
+            numsearches++;
+            return sr;
+        }
+    }
+
+    /* Oh, well, never mind.  Reuse the oldest slot. */
+    return oldest;
+}
+
+/* Insert the contents of a bucket into a search structure. */
+static void
+insert_search_bucket(struct bucket *b, struct search *sr)
+{
+    struct node *n;
+    n = b->nodes;
+    while(n) {
+        insert_search_node(n->id, (struct sockaddr*)&n->ss, n->sslen,
+                           sr, 0, NULL, 0);
+        n = n->next;
+    }
+}
+
+
